@@ -215,34 +215,77 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 	undidAlg, ips, doms, pdoms, blocklists = h.undoAlg(target.Addr(), preuid)
 	hasOldIPs := len(ips) > 0
 	if undidAlg && !hasOldIPs {
+		// the alg mapping for target has aged out. alg.go keeps the nat entry --
+		// and hence undidAlg -- for the lifetime of the tunnel, long after the ips
+		// and domains inside it expire, and signals exactly that by handing back no
+		// realips ("a way to signal that the alg mapping is stale", xLocked). So
+		// recover the flow by re-resolving the domain the mapping was minted for,
+		// instead of dropping it. Domain sources, in descending order of
+		// confidence: the authoritative alg mapping; the probable (reverse) mapping
+		// undoAlg already computes and which was, until now, thrown away here; and
+		// the stale mapping alg.go retains for staleDomainThres but never serves
+		// while translation is on.
 		hasNewIPs := false
 		if hasPre {
-			for d := range strings.SplitSeq(doms, ",") {
-				nodomain := len(d) <= 0
-				if nodomain {
-					if log.Verbose {
-						logwif(len(d) <= 0)("com: %s: onFlow: preflow: %v from %v => %v for %s; nodomain? %t",
-							h.proto, doms, src, target, preuid, nodomain)
+			// resolve reports whether any domain in domcsv resolved to usable ips.
+			resolve := func(domcsv string) bool {
+				for d := range strings.SplitSeq(domcsv, ",") {
+					nodomain := len(d) <= 0
+					if nodomain {
+						if log.Verbose {
+							logwif(len(d) <= 0)("com: %s: onFlow: preflow: %v from %v => %v for %s; nodomain? %t",
+								h.proto, domcsv, src, target, preuid, nodomain)
+						}
+						continue
 					}
-					continue
+					newips, err := dialers.ResolveFor(h.resolver, d, preuid)
+					ok := err == nil && len(newips) > 0
+					logwif(!ok)("com: %s: onFlow: preflow: resolved alg domain %s? %t; new ips %v for %s => %s; preuid: %s",
+						h.proto, d, ok, newips, src, dst, preuid)
+					if ok { // already unalg'd by ipmapper
+						ips = dnsx.Netip2Csv(newips)
+						// listener.Flow applies domain rules to doms; pdoms it only
+						// logs. Name the domain that actually resolved, so a rule on
+						// it still binds. Unspecified ips (ie a blocklisted answer)
+						// count as usable on purpose: that is how the rdns verdict
+						// reaches the listener -- never filter them out here.
+						doms = d
+						return true
+					} // else: either no known transport or preflow failed
 				}
-				newips, err := dialers.ResolveFor(h.resolver, d, preuid)
-				hasNewIPs = err == nil && len(newips) > 0
-				logwif(!hasNewIPs)("com: %s: onFlow: preflow: resolved alg domain %s? %t; new ips %v for %s => %s; preuid: %s",
-					h.proto, d, hasNewIPs, newips, src, dst, preuid)
-				if hasNewIPs { // already unalg'd by ipmapper
-					// _, ips, doms, pdoms, blocklists = h.undoAlg(target.Addr())
-					ips = dnsx.Netip2Csv(newips)
-					break
-				} // else: either no known transport or preflow failed
+				return false
+			}
+
+			hasNewIPs = resolve(doms) || resolve(pdoms)
+			if !hasNewIPs { // nothing live left; ask the stale reserve for a name
+				hasNewIPs = resolve(h.staleAlgDomains(target.Addr(), preuid))
+			}
+			if !hasNewIPs {
+				// last resort: the ips alg.go last knew for this mapping, kept for
+				// staleXipsThres. Out of date by definition, hence only once
+				// re-resolution has failed outright.
+				if sips := h.staleAlgIPs(target.Addr(), preuid); len(sips) > 0 {
+					ips = dnsx.Netip2Csv(sips)
+					hasNewIPs = true
+					log.W("com: %s: onFlow: alg: re-resolve failed for %s; dialing stale ips %v for %s => %s",
+						h.proto, doms, sips, src, dst)
+				}
 			}
 		} // else: either no known transport or preflow failed
 
+		// blocklists, read off the never-expiring nat entry, still describe this
+		// domain's last answer, so they stay as they are, for attribution. The rdns
+		// verdict does not ride on that string anyway: it rides on unspecified ips
+		// in "ips", which a re-resolution reproduces.
+
 		if !hasPre || !hasNewIPs {
-			log.E("com: %s: onFlow: alg, preflow? %t, ips? %t for %s; pre: %v; block!",
+			// nothing left to dial. Do NOT return here: fall through to
+			// listener.Flow so the drop is attributed, logged and governed by the
+			// user's own rules. An early return skips Flow entirely, leaving the
+			// flow with no conn-id, no log row and no summary -- invisible. It is
+			// forced to Block after Flow instead; see below.
+			log.E("com: %s: onFlow: alg, preflow? %t, ips? %t for %s; pre: %v; no ips to dial!",
 				h.proto, hasPre, hasNewIPs, doms, pre)
-			// either optionsBase (BlockModeNone) or optionsBlock
-			return fm, undidAlg, "", ""
 		} // else: if we've got target and/or old ips, dial them
 	} else {
 		if log.Debug {
@@ -288,6 +331,17 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 		log.W("com: %s: onFlow: preflow: preuid %s (%s => %s) is rethink (loopback? %t)! override %s to %s!",
 			h.proto, preuid, src, dst, loopback, fm.PIDCSV, egress)
 		fm.PIDCSV = egress
+	}
+
+	// an aged-out alg mapping that could not be recovered above has no address to
+	// dial: makeIPPorts falls back to the (unroutable) alg ip when the ip list is
+	// empty, so allowing the flow on would dial into a black hole. Block it -- but
+	// only now that listener.Flow has seen it, given it a conn-id and logged it,
+	// which the early return this replaces never allowed.
+	if undidAlg && len(ips) <= 0 && blockmode != settings.BlockModeNone &&
+		fm != optionsBlock && fm != optionsExit {
+		log.W("com: %s: onFlow: alg: no ips for %s (%s => %s); block!", h.proto, doms, src, dst)
+		fm.PIDCSV = ipn.Block
 	}
 
 	return
@@ -739,6 +793,33 @@ func (h *baseHandler) undoAlg(maybeAlg netip.Addr, uid string) (undidAlg bool, r
 
 	logwif(!hasreal)("com: %s: alg: undoAlg: for [%s] (gw? %t ok? %t, force? %t, withForce? %t) %s => %v (for %s + %s / block: %s)",
 		h.proto, uid, gw != nil, undidAlg, didForce, forcePTR, maybeAlg, realips, domains, probableDomains, blocklists)
+	return
+}
+
+// staleAlgDomains returns the domains the gateway still holds for an aged-out
+// alg ip, from the stale reserve (staleDomainThres) that PTR never serves while
+// alg translation is on. It is what makes such a mapping re-resolvable instead
+// of un-dialable; see dnsx.Gateway.PTRStale.
+func (h *baseHandler) staleAlgDomains(maybeAlg netip.Addr, uid string) (domains string) {
+	gw := h.resolver.Gateway()
+	if gw == nil || !ipok(maybeAlg) {
+		return
+	}
+	domains = gw.PTRStale(maybeAlg, uid, dnsx.NoDNS)
+	logwif(len(domains) <= 0)("com: %s: alg: stale domains for %v [%s]: %s", h.proto, maybeAlg, uid, domains)
+	return
+}
+
+// staleAlgIPs is the last-resort counterpart of staleAlgDomains: the real ips
+// the gateway last knew for an aged-out alg ip (kept for staleXipsThres). They
+// may name addresses the domain no longer uses, so callers must prefer a fresh
+// re-resolution and fall back to these only when that yields nothing.
+func (h *baseHandler) staleAlgIPs(maybeAlg netip.Addr, uid string) (ips []netip.Addr) {
+	gw := h.resolver.Gateway()
+	if gw == nil || !ipok(maybeAlg) {
+		return
+	}
+	ips, _ = gw.XStale(maybeAlg, uid)
 	return
 }
 

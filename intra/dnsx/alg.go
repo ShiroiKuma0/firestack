@@ -95,6 +95,10 @@ type Gateway interface {
 	X(maybeAlg netip.Addr, uid string, tids ...string) (realips []netip.Addr, undidAlg bool)
 	// given an alg or real ip, retrieves assoc dns names as csv, if any
 	PTR(maybeAlg netip.Addr, uid, tid string, force bool) (domaincsv string, didForce bool)
+	// given an alg ip, retrieves assoc real ips, incl recently expired (stale) ones, if any
+	XStale(maybeAlg netip.Addr, uid string, tids ...string) (realips []netip.Addr, undidAlg bool)
+	// given an alg ip, retrieves assoc dns names as csv, incl recently expired (stale) ones, if any
+	PTRStale(maybeAlg netip.Addr, uid, tid string) (domaincsv string)
 	// given domain, retrieve assoc alg ips or real ips as csv, if any
 	RESOLV(domain, uid, tid string) []netip.Addr
 	// given an alg or real ip, retrieve assoc blocklists as csv, if any
@@ -2054,11 +2058,45 @@ func (t *dnsgateway) PTR(maybeAlg netip.Addr, uid, tid string, force bool) (doma
 	// do not use t.ptr (realip -> ans) in mod (alg) mode, unless forced;
 	// as t.nat (algip -> ans) is a more accurate translation.
 	useptr := !t.mod.Load() || force
-	d := t.ptrLocked(maybeAlg, uid, tid, useptr)
+	d := t.ptrLocked(maybeAlg, uid, tid, useptr, false /*stale*/)
 	if len(d) > 0 {
 		domains = strings.Join(d, ",")
 	} // else: algip isn't really an alg ip, nothing to do
 	return domains, useptr
+}
+
+// XStale is X, but also serves ips that have outlived their ttl (kept for
+// staleXipsThres). X never does while alg translation is on (mod), so an alg
+// mapping a couple of minutes past its ttl is otherwise as good as deleted --
+// even though t.nat, and hence undidAlg, lives on for the tunnel's lifetime.
+// Callers use this to recover such a flow rather than drop it; the ips may be
+// out of date, so prefer re-resolving the domain (see PTRStale) over these.
+func (t *dnsgateway) XStale(maybeAlg netip.Addr, uid string, tids ...string) (ips []netip.Addr, undidAlg bool) {
+	t.RLock()
+	defer t.RUnlock()
+
+	if !t.split.Load() {
+		uid = core.UNKNOWN_UID_STR
+	}
+	return t.xLocked(maybeAlg, true /*usestale*/, uid, tids...) // ips may be 0 len
+}
+
+// PTRStale is PTR, but also serves domains that have outlived their ttl (kept
+// for staleDomainThres). PTR asks t.nat for live domains only, and its forced
+// variant reads t.ptr, which is keyed by real ips and so can never answer for
+// an alg ip. This is what makes an aged-out mapping re-resolvable. See XStale.
+func (t *dnsgateway) PTRStale(maybeAlg netip.Addr, uid, tid string) (domains string) {
+	t.RLock()
+	defer t.RUnlock()
+
+	if !t.split.Load() {
+		uid = core.UNKNOWN_UID_STR
+	}
+	d := t.ptrLocked(maybeAlg, uid, tid, true /*useptr*/, true /*stale*/)
+	if len(d) > 0 {
+		domains = strings.Join(d, ",")
+	} // else: nothing retained for this ip
+	return domains
 }
 
 func (t *dnsgateway) RESOLV(domain, uid, tid string) []netip.Addr {
@@ -2212,8 +2250,8 @@ func (t *dnsgateway) maybeUndoLocalNat64Locked(realips ...netip.Addr) (unnateds 
 	return copyUniq(unnateds)
 }
 
-func (t *dnsgateway) ptrLocked(maybeAlg netip.Addr, uid, tid string, useptr bool) (domains []string) {
-	alivedoms := true
+func (t *dnsgateway) ptrLocked(maybeAlg netip.Addr, uid, tid string, useptr, stale bool) (domains []string) {
+	alivedoms := !stale
 	hasnatdoms := false
 	hasdoms := false
 
@@ -2226,8 +2264,15 @@ func (t *dnsgateway) ptrLocked(maybeAlg netip.Addr, uid, tid string, useptr bool
 	if len(tid) <= 0 {
 		tid = notransport
 	}
+	// s/xalive/xall/ for stale: domains that outlived their ttl are kept for
+	// staleDomainThres and are the only thing left to re-resolve once an alg
+	// mapping ages out; t.nat itself never expires. See dnsgateway.PTRStale.
+	natdomstatus := xalive
+	if stale {
+		natdomstatus = xall
+	}
 	if ans, ok := t.nat[unmapped]; ok {
-		domains = domainsFor(ans, tid, uid, unmapped, xalive)
+		domains = domainsFor(ans, tid, uid, unmapped, natdomstatus)
 		hasnatdoms = len(domains) > 0
 		hasdoms = hasnatdoms
 	}
