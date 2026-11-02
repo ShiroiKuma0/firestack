@@ -91,6 +91,9 @@ var (
 	CacheLocalIPAnswers = false
 
 	cgnat4 = netip.MustParsePrefix("100.64.0.0/10")
+	// alg6 is the /80 that gen6Locked and take6Locked mint ip6 alg ips from (rfc8215a);
+	// no other source hands out addresses in it.
+	alg6 = netip.MustParsePrefix("64:ff9b:1:da19:100::/80")
 
 	errAlgNoTransport    = errors.New("no alg transport")
 	errAlgNotAvail       = errors.New("no valid alg ips")
@@ -147,6 +150,21 @@ func FirstCsvToken(csv string) string {
 	return strings.TrimSpace(csv)
 }
 
+// IsAlgSpace reports whether ip lies where this gateway mints alg ips: the rfc8215a
+// /80 for ip6, which nothing else uses, and, only when v4 is set, 100.64.0.0/10 for
+// ip4 -- a range alg shares with carrier-grade NAT and overlay networks, and so one
+// callers must only treat as alg while translation is on.
+func IsAlgSpace(ip netip.Addr, v4 bool) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	u := ip.Unmap()
+	if u.Is4() {
+		return v4 && cgnat4.Contains(u)
+	}
+	return alg6.Contains(u)
+}
+
 func isAlgErr(err error) bool {
 	return (err == errAlgCannotRegister || err == errAlgNotAvail || err == errAlgCannotSubst)
 }
@@ -170,6 +188,8 @@ type Gateway interface {
 	splitTunnel()
 	// fixedTransport returns true if split tunneling is enforced via dnsx.Fixed
 	fixedTransport() bool
+	// Translating reports whether answers are being rewritten to alg ips
+	Translating() bool
 	// Query using t1 as primary transport and t2 as secondary and preset as pre-determined ip answers
 	// network is the primary transport's proxy routing; snetwork is for the secondary transport.
 	q(t1, t2 Transport, preset []netip.Addr, origin, network, snetwork, uid string, q *dns.Msg, s *x.DNSSummary) (og *dns.Msg, algd *dns.Msg, err error)
@@ -1142,6 +1162,10 @@ func (t *dnsgateway) splitTunnel() {
 	}
 	t.split.Store(true)
 	log.I("alg: splitTunnel turned on")
+}
+
+func (t *dnsgateway) Translating() bool {
+	return t.mod.Load()
 }
 
 func (t *dnsgateway) fixedTransport() bool {

@@ -213,6 +213,20 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 	// alg happens after nat64, and so, alg knows nat-ed ips and un-nats them;
 	// that is, real ips ("ips") are already un-nated where applicable.
 	undidAlg, ips, doms, pdoms, blocklists = h.undoAlg(target.Addr(), preuid)
+	// an alg ip this gateway has no record of at all: minted by a previous run of the
+	// tunnel (its alg table lives in memory only, so every restart -- an app update, a
+	// crash, a force-stop -- orphans the alg ips apps still hold), and handed back
+	// unchanged by X as if it were a real ip. Dialing it literally goes nowhere, and
+	// each attempt hangs until the dial timeout (~20s), for as long as the app keeps
+	// its cached answer: minutes of dead connectivity after every restart. Fail it
+	// at once instead, so the app looks the name up again. Nothing to recover from:
+	// no domain is known for it (one would make it an aged-out mapping, handled below).
+	orphanAlg := !undidAlg && len(doms) <= 0 && len(pdoms) <= 0 && h.isOrphanAlgSpace(target.Addr())
+	if orphanAlg {
+		ips = "" // nothing real to dial; listener.Flow sees an alg ip with no real ips
+		log.W("com: %s: onFlow: alg: orphaned alg ip %s => %s for %s (from a previous run?); reject!",
+			h.proto, src, dst, preuid)
+	}
 	hasOldIPs := len(ips) > 0
 	if undidAlg && !hasOldIPs {
 		// the alg mapping for target has aged out. alg.go keeps the nat entry --
@@ -338,7 +352,7 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 	// empty, so allowing the flow on would dial into a black hole. Block it -- but
 	// only now that listener.Flow has seen it, given it a conn-id and logged it,
 	// which the early return this replaces never allowed.
-	if undidAlg && len(ips) <= 0 && blockmode != settings.BlockModeNone &&
+	if (undidAlg || orphanAlg) && len(ips) <= 0 && blockmode != settings.BlockModeNone &&
 		fm != optionsBlock && fm != optionsExit {
 		log.W("com: %s: onFlow: alg: no ips for %s (%s => %s); block!", h.proto, doms, src, dst)
 		fm.PIDCSV = ipn.Block
@@ -794,6 +808,18 @@ func (h *baseHandler) undoAlg(maybeAlg netip.Addr, uid string) (undidAlg bool, r
 	logwif(!hasreal)("com: %s: alg: undoAlg: for [%s] (gw? %t ok? %t, force? %t, withForce? %t) %s => %v (for %s + %s / block: %s)",
 		h.proto, uid, gw != nil, undidAlg, didForce, forcePTR, maybeAlg, realips, domains, probableDomains, blocklists)
 	return
+}
+
+// isOrphanAlgSpace reports whether ip lies in the gateway's alg space: always for the
+// ip6 alg prefix, which nothing else uses, but for 100.64.0.0/10 only while alg
+// translation is on -- off, an address there is a real carrier-grade-NAT or overlay
+// peer, not an orphan.
+func (h *baseHandler) isOrphanAlgSpace(ip netip.Addr) bool {
+	gw := h.resolver.Gateway()
+	if gw == nil {
+		return false
+	}
+	return dnsx.IsAlgSpace(ip, gw.Translating())
 }
 
 // staleAlgDomains returns the domains the gateway still holds for an aged-out
