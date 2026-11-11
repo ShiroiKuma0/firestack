@@ -308,6 +308,25 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 		}
 	}
 
+	// an app dialing a v6 alg ip gets, for real ips, only the AAAA answer that ip
+	// was minted for. When the tunnel routes v6 but the network underneath has none
+	// (ip version "IPv4 & IPv6" on a v4-only wifi), every one of them fails with
+	// "network is unreachable" -- after netstack has already syn-acked the app, so
+	// the app sees its connection reset mid-handshake and, having connected, never
+	// tries the A answer itself. Hand the dial loop the domain's v4 addresses too;
+	// makeIPPorts keeps the flow's own family first, so they are reached only once
+	// every v6 address has failed. Done here, before listener.Flow, so the client's
+	// ip rules see the addresses that may actually be dialed.
+	if undidAlg && hasOldIPs && hasPre && v6MayBeDown() {
+		if a := target.Addr(); a.Is6() && !a.Is4In6() {
+			if more := h.v4FallbackIPs(ips, doms, preuid); len(more) > 0 {
+				log.I("com: %s: onFlow: alg: v6 may be unreachable; adding v4 fallback %v for %s (%s => %s)",
+					h.proto, more, doms, src, dst)
+				ips = ips + "," + dnsx.Netip2Csv(more)
+			}
+		}
+	}
+
 	if log.Debug && (len(ips) <= 0 || len(doms) <= 0) {
 		log.D("com: %s: onFlow: no realips(%s) or domains(%s + %s), for src=%s dst=%s; preuid=%s; alg? %t",
 			h.proto, ips, doms, pdoms, localaddr, target, preuid, undidAlg)
@@ -688,6 +707,74 @@ func makeAnyAddrPort(origipp netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(anyaddr6, origipp.Port())
 }
 
+// lastV6Unreach is when (unix nanos) an egress dial to a v6 address last failed
+// for want of a route; zero if the last v6 dial went through.
+var lastV6Unreach atomic.Int64
+
+// v6UnreachWindow is how long one such failure keeps v4 fallbacks coming; past
+// it a v6 flow is dialed on its own again, which re-tests the network.
+const v6UnreachWindow = 10 * time.Minute
+
+// noteV6Dial records the outcome of an egress dial, if dst is a v6 address.
+func noteV6Dial(dst netip.Addr, err error) {
+	if !dst.Is6() || dst.Is4In6() {
+		return
+	}
+	if err == nil {
+		lastV6Unreach.Store(0)
+	} else if strings.Contains(err.Error(), "network is unreachable") {
+		lastV6Unreach.Store(time.Now().UnixNano())
+	}
+}
+
+// v6MayBeDown reports whether dialing v6 is likely to fail for want of a v6
+// network: either the client says a family is missing while both are in use
+// (PtModeForce), or a v6 dial was recently refused with "network is unreachable".
+func v6MayBeDown() bool {
+	if !dialers.Use4() || !dialers.Use6() {
+		return false // single-family tunnels are filtered / translated elsewhere
+	}
+	if settings.PtMode.Load() == settings.PtModeForce {
+		return true
+	}
+	t := lastV6Unreach.Load()
+	return t > 0 && time.Since(time.Unix(0, t)) < v6UnreachWindow
+}
+
+// maxV4Fallback caps the v4 addresses added to a v6 alg flow.
+const maxV4Fallback = 4
+
+// v4FallbackIPs returns the v4 addresses of the domains in domcsv, if ipcsv (the
+// real ips of a v6 alg flow) holds nothing but usable v6 addresses. An
+// unspecified ip in ipcsv is a blocklist verdict and is left alone.
+func (h *baseHandler) v4FallbackIPs(ipcsv, domcsv, uid string) (out []netip.Addr) {
+	if len(ipcsv) <= 0 || len(domcsv) <= 0 {
+		return
+	}
+	for _, ip := range dnsx.Csv2Netip(ipcsv) {
+		if !ipok(ip) || ip.Unmap().Is4() {
+			return
+		}
+	}
+	for d := range strings.SplitSeq(domcsv, ",") {
+		if len(d) <= 0 {
+			continue
+		}
+		newips, err := dialers.ResolveFor(h.resolver, d, uid)
+		if err != nil {
+			continue
+		}
+		for _, ip := range newips {
+			if ip = ip.Unmap(); ipok(ip) && ip.Is4() && !slices.Contains(out, ip) {
+				if out = append(out, ip); len(out) >= maxV4Fallback {
+					return
+				}
+			}
+		}
+	}
+	return
+}
+
 // makeIPPorts returns a slice of valid, non-zero at most cap AddrPorts.
 // The first element may be origipp AddrPort, if realips is empty or contains only unspecified IPs.
 // or maybeIncludeOrig is true and origipp's IP family is included in dialer's current config.
@@ -701,6 +788,7 @@ func makeIPPorts(r dnsx.Resolver, ips []netip.Addr, origipp netip.AddrPort, mayb
 	orig4 := origipp.Addr().Is4()
 	orig6 := origipp.Addr().Is6()
 
+	use46 := use4 && use6
 	if use4 && use6 {
 		// happy-eyeballs from clients should take care of dialing both
 		// families when both v4 and v6 routes are available.
@@ -750,6 +838,20 @@ func makeIPPorts(r dnsx.Resolver, ips []netip.Addr, origipp netip.AddrPort, mayb
 	}
 	if len(out) > 0 {
 		s := core.ShuffleInPlace(out)
+		if use46 {
+			// the flow's own family first: the other one is there as a fallback
+			// (see v4FallbackIPs), not to be picked at random ahead of it.
+			slices.SortStableFunc(s, func(a, b netip.AddrPort) int {
+				asame := a.Addr().Unmap().Is4() == orig4
+				bsame := b.Addr().Unmap().Is4() == orig4
+				if asame == bsame {
+					return 0
+				} else if asame {
+					return -1
+				}
+				return 1
+			})
+		}
 		if willIncludeOrig {
 			if useOrig46 {
 				s = append([]netip.AddrPort{origipp46}, s...)

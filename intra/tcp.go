@@ -465,6 +465,10 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 	smm.PID = pidstr(px)
 	smm.RPID = ipn.ViaID(px)
 
+	if ipn.IsAnyLocalProxy(pid) { // exit, base: dials straight out to target
+		noteV6Dial(target.Addr(), err)
+	}
+
 	if err != nil || dst == nil {
 		clos(pc)
 		log.W("tcp: err dialing %s proxy(%s) %v [%v] => %v (bind? %t) for %s: %v",
