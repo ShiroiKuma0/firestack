@@ -316,6 +316,18 @@ func (d *dns64) eval(network string, force64 bool, ansin *dns.Msg, r, uid string
 		// xdns.MaybeToQuadA failed for every A ans4 record
 		return nil
 	}
+	// ans64 is built off ans4, the answer to the A query made above, and so it
+	// still carries that query's question section (qname A). A stub resolver
+	// matches an answer to its query by id AND question, and drops one whose
+	// question it did not ask: the client got its synthesized AAAA records in
+	// milliseconds and then waited out its full timeout for "the" answer (seen
+	// 2026-11-22, dig: "Question section mismatch: got <qname>/A/IN"; android's
+	// resolver likewise, stalling getaddrinfo for every v4-only host).
+	if len(ansin.Question) > 0 {
+		ans64.Question = append([]dns.Question(nil), ansin.Question...)
+		ans64.Id = ansin.Id
+		log.D("dns64: %s for %s: question restored to the aaaa asked", qname, uid)
+	}
 	return ans64
 }
 
