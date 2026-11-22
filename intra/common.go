@@ -317,11 +317,24 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
 	// makeIPPorts keeps the flow's own family first, so they are reached only once
 	// every v6 address has failed. Done here, before listener.Flow, so the client's
 	// ip rules see the addresses that may actually be dialed.
-	if undidAlg && hasOldIPs && hasPre && v6MayBeDown() {
+	//
+	// Not only when v6 looks down underneath (v6MayBeDown): a flow may be handed
+	// to a proxy that carries no v6 at all (a v4-only wireguard tunnel) while the
+	// network itself has working v6 -- no proxy can then route the flow and it is
+	// reset just the same (seen 2026-11-21: every v6 flow of an app bound to such
+	// a tunnel, on a dual-stack mobile network). Which proxy takes the flow is not
+	// known before listener.Flow, so the fallback is added for every v6 alg flow
+	// while both families are in use.
+	if undidAlg && hasOldIPs && hasPre && dialers.Use4() && dialers.Use6() {
 		if a := target.Addr(); a.Is6() && !a.Is4In6() {
 			if more := h.v4FallbackIPs(ips, doms, preuid); len(more) > 0 {
-				log.I("com: %s: onFlow: alg: v6 may be unreachable; adding v4 fallback %v for %s (%s => %s)",
-					h.proto, more, doms, src, dst)
+				if v6MayBeDown() {
+					log.I("com: %s: onFlow: alg: v6 may be unreachable; adding v4 fallback %v for %s (%s => %s)",
+						h.proto, more, doms, src, dst)
+				} else if log.Debug {
+					log.D("com: %s: onFlow: alg: v4 fallback %v for v6 flow to %s (%s => %s)",
+						h.proto, more, doms, src, dst)
+				}
 				ips = ips + "," + dnsx.Netip2Csv(more)
 			}
 		}
