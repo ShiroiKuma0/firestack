@@ -297,7 +297,16 @@ func (h *tcpHandler) Proxy(gconn *netstack.GTCPConn, src, target netip.AddrPort)
 		core.Go("tcp.stall."+fid, func() {
 			defer clos(gconn)
 			defer h.queueSummary(smm.done(err))
-			secs := h.stall(fid)
+			// a blocked dns-over-tls attempt is refused at once: the client is a
+			// resolver (android's own, in "automatic" private dns mode) that falls
+			// back to plain dns only once this connection dies, so every second it
+			// is stalled here is a second added to each of the device's lookups.
+			var secs uint32
+			if target.Port() == dotPort {
+				log.I("tcp: %s blocked dot %s => %s for %s; no stall", cid, src, target, uid)
+			} else {
+				secs = h.stall(fid)
+			}
 			log.I("tcp: %s firewalled from %s => %s (dom: %s / real: %s) for %s; stall? %ds",
 				cid, src, target, domains, realips, uid, secs)
 		})
@@ -499,3 +508,6 @@ func (h *tcpHandler) handle(px ipn.Proxy, gconn *netstack.GTCPConn, src, target 
 
 	return cont, nil // handled; takes ownership of src
 }
+
+// dotPort is the dns-over-tls port; see the block path in Proxy.
+const dotPort = 853
