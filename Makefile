@@ -75,9 +75,12 @@ $(BUILDDIR)/android/tun2socks.aar: $(GOMOBILE) $(BUILD_OVERLAY)
 	mkdir -p $(BUILDDIR)/android
 	$(ANDROID_BUILD_CMD) -o $@ $(IMPORT_PATH)/outline/android $(IMPORT_PATH)/outline/shadowsocks
 
-$(BUILD_OVERLAY): $(TOOLSDIR)/runtime_write_err_android.patch
+# runtime_boottime_linux.patch: the runtime's clock counts the time the device was
+# suspended (CLOCK_BOOTTIME), else wireguard-go takes a session the peer has long
+# discarded for a fresh one after a sleep, and the first flow hangs 15s.
+$(BUILD_OVERLAY): $(TOOLSDIR)/runtime_write_err_android.patch $(TOOLSDIR)/runtime_boottime_linux.patch
 	mkdir -p $(BUILDDIR)
-	env PATH=$(GOBIN):$(PATH) $(GOPATCHOVERLAY) -overlay $(BUILDDIR) $(TOOLSDIR)/runtime_write_err_android.patch
+	env PATH=$(GOBIN):$(PATH) $(GOPATCHOVERLAY) -overlay $(BUILDDIR) $(TOOLSDIR)/runtime_write_err_android.patch $(TOOLSDIR)/runtime_boottime_linux.patch
 
 $(LINUX_BUILDDIR)/tun2socks: $(XGO)
 	$(XGO) -ldflags $(XGO_LDFLAGS) --targets=linux/amd64 -dest $(LINUX_BUILDDIR) $(ELECTRON_PATH)

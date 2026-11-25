@@ -1,0 +1,55 @@
+diff --git a/src/runtime/sys_linux_386.s b/src/runtime/sys_linux_386.s
+--- a/src/runtime/sys_linux_386.s	2026-11-25 23:32:04.608406334 +0100
++++ b/src/runtime/sys_linux_386.s	2026-11-25 23:32:04.617646804 +0100
+@@ -365,13 +365,13 @@
+ 
+ 	LEAL	8(SP), BX	// &ts (struct timespec)
+ 	MOVL	BX, 4(SP)
+-	MOVL	$1, 0(SP)	// CLOCK_MONOTONIC
++	MOVL	$7, 0(SP)	// kojiki: CLOCK_BOOTTIME, was CLOCK_MONOTONIC
+ 	CALL	AX
+ 	JMP finish
+ 
+ fallback:
+ 	MOVL	$SYS_clock_gettime, AX
+-	MOVL	$1, BX		// CLOCK_MONOTONIC
++	MOVL	$7, BX		// kojiki: CLOCK_BOOTTIME, was CLOCK_MONOTONIC
+ 	LEAL	8(SP), CX
+ 	INVOKE_SYSCALL
+ 
+diff --git a/src/runtime/sys_linux_amd64.s b/src/runtime/sys_linux_amd64.s
+--- a/src/runtime/sys_linux_amd64.s	2026-11-25 23:32:04.611221980 +0100
++++ b/src/runtime/sys_linux_amd64.s	2026-11-25 23:32:04.619616698 +0100
+@@ -267,7 +267,7 @@
+ 	SUBQ	$16, SP		// Space for results
+ 	ANDQ	$~15, SP	// Align for C code
+ 
+-	MOVL	$1, DI // CLOCK_MONOTONIC
++	MOVL	$7, DI // kojiki: CLOCK_BOOTTIME, was CLOCK_MONOTONIC
+ 	LEAQ	0(SP), SI
+ 	MOVQ	runtime·vdsoClockgettimeSym(SB), AX
+ 	CMPQ	AX, $0
+diff --git a/src/runtime/sys_linux_arm.s b/src/runtime/sys_linux_arm.s
+--- a/src/runtime/sys_linux_arm.s	2026-11-25 23:32:04.605384894 +0100
++++ b/src/runtime/sys_linux_arm.s	2026-11-25 23:32:04.615699588 +0100
+@@ -11,7 +11,7 @@
+ #include "textflag.h"
+ 
+ #define CLOCK_REALTIME	0
+-#define CLOCK_MONOTONIC	1
++#define CLOCK_MONOTONIC	7 // kojiki: CLOCK_BOOTTIME, so that time spent suspended counts
+ 
+ // for EABI, as we don't support OABI
+ #define SYS_BASE 0x0
+diff --git a/src/runtime/sys_linux_arm64.s b/src/runtime/sys_linux_arm64.s
+--- a/src/runtime/sys_linux_arm64.s	2026-11-25 23:32:04.602569173 +0100
++++ b/src/runtime/sys_linux_arm64.s	2026-11-25 23:32:04.613901231 +0100
+@@ -14,7 +14,7 @@
+ #define AT_FDCWD -100
+ 
+ #define CLOCK_REALTIME 0
+-#define CLOCK_MONOTONIC 1
++#define CLOCK_MONOTONIC 7 // kojiki: CLOCK_BOOTTIME, so that time spent suspended counts
+ 
+ #define SYS_exit		93
+ #define SYS_read		63
